@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -32,12 +31,12 @@ import (
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/reference"
 	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker/schema1" //nolint:staticcheck // Ignore SA1019. Need to keep deprecated package for compatibility.
-	remoteerrors "github.com/containerd/containerd/remotes/errors"
+	"github.com/containerd/containerd/remotes/docker/schema1"
 	"github.com/containerd/containerd/version"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/net/context/ctxhttp"
 )
 
 var (
@@ -190,6 +189,63 @@ func NewResolver(options ResolverOptions) remotes.Resolver {
 	}
 }
 
+func NewResolverM(options ResolverOptions) remotes.Resolver {
+	if options.Tracker == nil {
+		options.Tracker = NewInMemoryTracker()
+	}
+
+	if options.Headers == nil {
+		options.Headers = make(http.Header)
+	}
+	if _, ok := options.Headers["User-Agent"]; !ok {
+		options.Headers.Set("User-Agent", "containerd/"+version.Version)
+	}
+
+	resolveHeader := http.Header{}
+	if _, ok := options.Headers["Accept"]; !ok {
+		// set headers for all the types we support for resolution.
+		resolveHeader.Set("Accept", strings.Join([]string{
+			images.MediaTypeDockerSchema2Manifest,
+			images.MediaTypeDockerSchema2ManifestList,
+			ocispec.MediaTypeImageManifest,
+			ocispec.MediaTypeImageIndex, "*/*"}, ", "))
+	} else {
+		resolveHeader["Accept"] = options.Headers["Accept"]
+		delete(options.Headers, "Accept")
+	}
+
+	if options.Hosts == nil {
+		opts := []RegistryOpt{}
+		if options.Host != nil {
+			opts = append(opts, WithHostTranslator(options.Host))
+		}
+
+		if options.Authorizer == nil {
+			options.Authorizer = NewDockerAuthorizer(
+				WithAuthClient(options.Client),
+				WithAuthHeader(options.Headers),
+				WithAuthCreds(options.Credentials))
+		}
+		opts = append(opts, WithAuthorizer(options.Authorizer))
+
+		if options.Client != nil {
+			opts = append(opts, WithClient(options.Client))
+		}
+		if options.PlainHTTP {
+			opts = append(opts, WithPlainHTTP(MatchAllHosts))
+		} else {
+			opts = append(opts, WithPlainHTTP(MatchLocalhost))
+		}
+		options.Hosts = ConfigureDefaultRegistriesM(opts...)
+	}
+	return &dockerResolver{
+		hosts:         options.Hosts,
+		header:        options.Headers,
+		resolveHeader: resolveHeader,
+		tracker:       options.Tracker,
+	}
+}
+
 func getManifestMediaType(resp *http.Response) string {
 	// Strip encoding data (manifests should always be ascii JSON)
 	contentType := resp.Header.Get("Content-Type")
@@ -299,11 +355,11 @@ func (r *dockerResolver) Resolve(ctx context.Context, ref string) (string, ocisp
 				if resp.StatusCode > 399 {
 					// Set firstErr when encountering the first non-404 status code.
 					if firstErr == nil {
-						firstErr = remoteerrors.NewUnexpectedStatusErr(resp)
+						firstErr = fmt.Errorf("pulling from host %s failed with status code %v: %v", host.Host, u, resp.Status)
 					}
 					continue // try another host
 				}
-				return "", ocispec.Descriptor{}, remoteerrors.NewUnexpectedStatusErr(resp)
+				return "", ocispec.Descriptor{}, fmt.Errorf("pulling from host %s failed with unexpected status code %v: %v", host.Host, u, resp.Status)
 			}
 			size := resp.ContentLength
 			contentType := getManifestMediaType(resp)
@@ -525,7 +581,7 @@ type request struct {
 
 func (r *request) do(ctx context.Context) (*http.Response, error) {
 	u := r.host.Scheme + "://" + r.host.Host + r.path
-	req, err := http.NewRequestWithContext(ctx, r.method, u, nil)
+	req, err := http.NewRequest(r.method, u, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +623,7 @@ func (r *request) do(ctx context.Context) (*http.Response, error) {
 		}
 	}
 
-	resp, err := client.Do(req)
+	resp, err := ctxhttp.Do(ctx, client, req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to do request: %w", err)
 	}
@@ -667,18 +723,4 @@ func responseFields(resp *http.Response) logrus.Fields {
 	}
 
 	return logrus.Fields(fields)
-}
-
-// IsLocalhost checks if the registry host is local.
-func IsLocalhost(host string) bool {
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-
-	if host == "localhost" {
-		return true
-	}
-
-	ip := net.ParseIP(host)
-	return ip.IsLoopback()
 }

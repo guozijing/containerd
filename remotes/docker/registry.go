@@ -17,9 +17,11 @@
 package docker
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
+	"time"
 )
 
 // HostCapabilities represent the capabilities of the registry
@@ -193,6 +195,65 @@ func ConfigureDefaultRegistries(ropts ...RegistryOpt) RegistryHosts {
 			config.Host = "registry-1.docker.io"
 		}
 
+		return []RegistryHost{config}, nil
+	}
+}
+
+func ConfigureDefaultRegistriesM(ropts ...RegistryOpt) RegistryHosts {
+	var opts registryOpts
+	for _, opt := range ropts {
+		opt(&opts)
+	}
+
+	return func(host string) ([]RegistryHost, error) {
+		config := RegistryHost{
+			Client:       opts.client,
+			Authorizer:   opts.authorizer,
+			Host:         host,
+			Scheme:       "https",
+			Path:         "/v2",
+			Capabilities: HostCapabilityPull | HostCapabilityResolve | HostCapabilityPush,
+		}
+
+		if config.Client == nil {
+			config.Client = http.DefaultClient
+		}
+
+		if opts.plainHTTP != nil {
+			match, err := opts.plainHTTP(host)
+			if err != nil {
+				return nil, err
+			}
+			if match {
+				config.Scheme = "http"
+			}
+		}
+
+		if opts.host != nil {
+			var err error
+			config.Host, err = opts.host(config.Host)
+			if err != nil {
+				return nil, err
+			}
+		} else if host == "docker.io" {
+			config.Host = "registry-1.docker.io"
+		}
+
+		config.Client.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:       30 * time.Second,
+				KeepAlive:     30 * time.Second,
+				FallbackDelay: 300 * time.Millisecond,
+			}).DialContext,
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+			ExpectContinueTimeout: 5 * time.Second,
+		}
 		return []RegistryHost{config}, nil
 	}
 }
